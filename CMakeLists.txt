@@ -73,7 +73,7 @@ if (BOOST_BEAST2_BUILD_TESTS)
     set(BOOST_BEAST2_UNIT_TEST_LIBRARIES beast url)
 endif ()
 if (BOOST_BEAST2_BUILD_EXAMPLES)
-    set(BOOST_BEAST2_EXAMPLE_LIBRARIES json program_options scope url multiprecision)
+    set(BOOST_BEAST2_EXAMPLE_LIBRARIES json program_options scope url multiprecision redis)
 endif ()
 # Complete dependency list
 set(BOOST_INCLUDE_LIBRARIES ${BOOST_BEAST2_INCLUDE_LIBRARIES} ${BOOST_BEAST2_UNIT_TEST_LIBRARIES} ${BOOST_BEAST2_EXAMPLE_LIBRARIES})

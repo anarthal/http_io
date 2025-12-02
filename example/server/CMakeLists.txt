@@ -27,6 +27,7 @@ target_link_libraries(
     beast2_server_example
     Boost::beast2
     Boost::url
+    Boost::redis
     OpenSSL::SSL
     OpenSSL::Crypto
     )
