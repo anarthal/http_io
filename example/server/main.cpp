@@ -16,6 +16,8 @@
 #include <boost/asio/detached.hpp>
 #include <boost/beast2/asio_io_context.hpp>
 #include <boost/beast2/server/http_server.hpp>
+#include <boost/beast2/server/route_handler.hpp>
+#include <boost/beast2/server/route_handler_asio.hpp>
 #include <boost/beast2/server/router.hpp>
 #include <boost/beast2/server/router_types.hpp>
 #include <boost/beast2/server/serve_static.hpp>
@@ -29,6 +31,7 @@
 #include <boost/capy/zlib/deflate.hpp>
 #include <boost/capy/zlib/inflate.hpp>
 #include <boost/redis/connection.hpp>
+#include <boost/system/detail/error_code.hpp>
 #include <boost/system/error_code.hpp>
 #include <iostream>
 
@@ -70,33 +73,36 @@ public:
 
 using socket_type = asio::basic_stream_socket<asio::ip::tcp, asio::io_context::executor_type>;
 
-system::error_code spawn_coroutine(
-    Request& req,
-    ResponseAsio<socket_type&>& res,
-    std::function<asio::awaitable<system::error_code>()> awfn
-)
-{
-    return res.detach([&res, awfn = std::move(awfn)](resumer resume){
-        asio::co_spawn(
-            res.stream.get_executor(),
-            std::move(awfn),
-            [&res, resume](std::exception_ptr exc, system::error_code ec) {
-                if (exc) {
-                    try {
-                        std::rethrow_exception(exc);
-                    } catch (const std::exception& err) {
-                        std::cerr << "Exception: " << err.what() << std::endl;
+struct co_handler {
+    using fn_type = std::function<asio::awaitable<system::error_code>(Request& req, ResponseAsio<socket_type&>& res)>;
+    
+    fn_type fn;
+
+    system::error_code operator()(Request& req, ResponseAsio<socket_type&>& res) const
+    {
+        return res.detach([&res, aw = fn(req, res)](resumer resume) mutable {
+            asio::co_spawn(
+                res.stream.get_executor(),
+                std::move(aw),
+                [&res, resume](std::exception_ptr exc, system::error_code ec) {
+                    if (exc) {
+                        try {
+                            std::rethrow_exception(exc);
+                        } catch (const std::exception& err) {
+                            std::cerr << "Exception: " << err.what() << std::endl;
+                        }
+                        res.status(http_proto::status::internal_server_error);
+                        res.set_body("");
+                        resume(route::close);
+                    } else {
+                        resume(ec);
                     }
-                    res.status(http_proto::status::internal_server_error);
-                    res.set_body("");
-                    resume(route::close);
-                } else {
-                    resume(ec);
                 }
-            }
-        );
-    });
-}
+            );
+        });
+    }
+
+};
 
 int server_main( int argc, char* argv[] )
 {
@@ -122,68 +128,65 @@ int server_main( int argc, char* argv[] )
         redis::config cfg;
         auto& redis = app.insert<redis_client>(redis_client{app.get<asio_io_context>().get_executor(), cfg});
 
-        srv.wwwroot.use("/", [&app](Request& req, ResponseAsio<socket_type&>& res) -> system::error_code {
+        srv.wwwroot.use("/", co_handler{[&app](Request& req, ResponseAsio<socket_type&>& res) -> asio::awaitable<system::error_code> {
             // Get the ID from the URL params
             const auto params = req.url.params();
             auto it = params.find("id");
             if (it == params.end()) {
-                return route::next;
+                co_return route::next;
             }
             auto id = (*it).value;
+            auto& conn = app.get<redis_client>().get();
+            auto redis_key = "ruben:" + id;
 
-            return spawn_coroutine(req, res, [&req, &res, &app, id = std::move(id)]() -> asio::awaitable<system::error_code> {
-                auto& conn = app.get<redis_client>().get();
-                auto redis_key = "ruben:" + id;
+            // Get the key
+            redis::request redis_req;
+            redis_req.push("GET", redis_key);
+            redis::response<std::optional<std::string>> redis_res;
+            auto [ec, s] = co_await conn.async_exec(redis_req, redis_res, asio::as_tuple);
+            std::cerr << "Error in GET: " << ec << std::endl;
+            const auto& val = std::get<0>(redis_res).value();
 
-                // Get the key
-                redis::request redis_req;
-                redis_req.push("GET", redis_key);
-                redis::response<std::optional<std::string>> redis_res;
-                auto [ec, s] = co_await conn.async_exec(redis_req, redis_res, asio::as_tuple);
-                std::cerr << "Error in GET: " << ec << std::endl;
-                const auto& val = std::get<0>(redis_res).value();
+            if (val.has_value()) {
+                res.status(http_proto::status::ok);
+                res.set_body(*val);
+                co_return route::send;
+            } else {
+                co_return route::next;
+            }
+        }});
+            
 
-                if (val.has_value()) {
-                    res.status(http_proto::status::ok);
-                    res.set_body(*val);
-                    co_return route::send;
-                } else {
-                    co_return route::next;
-                }
-            });
-        });
-
-        srv.wwwroot.add(http_proto::method::get, "/ruben", [&app](Request& req, ResponseAsio<socket_type&>& res) -> system::error_code {
+        srv.wwwroot.add(http_proto::method::get, "/ruben", co_handler{[&app](Request& req, ResponseAsio<socket_type&>& res) -> asio::awaitable<system::error_code> {
             const auto params = req.url.params();
             auto it = params.find("id");
             if (it == params.end()) {
                 res.status(http_proto::status::not_found);
                 res.set_body("");
-                return route::send;
+                co_return route::send;
             }
             auto id = (*it).value;
 
-            return spawn_coroutine(req, res, [&req, &res, &app, id = std::move(id)]() -> asio::awaitable<system::error_code> {
-                auto& conn = app.get<redis_client>().get();
-                auto redis_key = "ruben:" + id;
+            auto& conn = app.get<redis_client>().get();
+            auto redis_key = "ruben:" + id;
 
-                // Do some really expensive calculation
-                asio::steady_timer timer (res.stream.get_executor());
-                timer.expires_after(std::chrono::seconds(4));
-                co_await timer.async_wait();
-                std::string body = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+            // Do some really expensive calculation
+            asio::steady_timer timer (res.stream.get_executor());
+            timer.expires_after(std::chrono::seconds(4));
+            co_await timer.async_wait();
+            std::string body = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 
-                // Set the key in Redis, cache it for 30 seconds
-                redis::request redis_req;
-                redis_req.push("SET", redis_key, body, "EX", 30);
-                co_await conn.async_exec(redis_req, redis::ignore);
+            // Set the key in Redis, cache it for 30 seconds
+            redis::request redis_req;
+            redis_req.push("SET", redis_key, body, "EX", 30);
+            co_await conn.async_exec(redis_req, redis::ignore);
 
-                // Compose the response
-                res.status(http_proto::status::ok);
-                res.set_body(body);
-                co_return route::send;
-            });
-        });
+            // Compose the response
+            res.status(http_proto::status::ok);
+            res.set_body(body);
+            co_return route::send;
+        }});
+
 
 
         srv.wwwroot.use("/", serve_static( argv[3] ));
