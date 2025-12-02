@@ -73,12 +73,11 @@ public:
 
 using socket_type = asio::basic_stream_socket<asio::ip::tcp, asio::io_context::executor_type>;
 
+template <class Handler>
 struct co_handler {
-    using fn_type = std::function<asio::awaitable<system::error_code>(Request& req, ResponseAsio<socket_type&>& res)>;
-    
-    fn_type fn;
+    Handler fn;
 
-    system::error_code operator()(Request& req, ResponseAsio<socket_type&>& res) const
+    system::error_code operator()(Request& req, auto& res) const
     {
         return res.detach([&res, aw = fn(req, res)](resumer resume) mutable {
             asio::co_spawn(
@@ -128,7 +127,7 @@ int server_main( int argc, char* argv[] )
         redis::config cfg;
         auto& redis = app.insert<redis_client>(redis_client{app.get<asio_io_context>().get_executor(), cfg});
 
-        srv.wwwroot.use("/", co_handler{[&app](Request& req, ResponseAsio<socket_type&>& res) -> asio::awaitable<system::error_code> {
+        srv.wwwroot.use("/users", co_handler{[&app](Request& req, ResponseAsio<socket_type&>& res) -> asio::awaitable<system::error_code> {
             // Get the ID from the URL params
             const auto params = req.url.params();
             auto it = params.find("id");
@@ -157,7 +156,7 @@ int server_main( int argc, char* argv[] )
         }});
             
 
-        srv.wwwroot.add(http_proto::method::get, "/ruben", co_handler{[&app](Request& req, ResponseAsio<socket_type&>& res) -> asio::awaitable<system::error_code> {
+        srv.wwwroot.add(http_proto::method::get, "/users/ruben", co_handler{[&app](Request& req, ResponseAsio<socket_type&>& res) -> asio::awaitable<system::error_code> {
             const auto params = req.url.params();
             auto it = params.find("id");
             if (it == params.end()) {
